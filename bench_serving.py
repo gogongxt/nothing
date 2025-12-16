@@ -103,11 +103,23 @@ def remove_suffix(text: str, suffix: str) -> str:
 
 
 def get_auth_headers() -> Dict[str, str]:
+    headers = {}
+
+    # Add authorization header if API key is provided
     api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
-        return {"Authorization": f"Bearer {api_key}"}
-    else:
-        return {}
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Add custom headers from environment variable
+    custom_headers_str = os.environ.get("CUSTOM_HEADERS")
+    if custom_headers_str:
+        try:
+            custom_headers = json.loads(custom_headers_str)
+            headers.update(custom_headers)
+        except json.JSONDecodeError:
+            print(f"Warning: Failed to parse CUSTOM_HEADERS: {custom_headers_str}")
+
+    return headers
 
 
 # trt llm does not support ignore_eos
