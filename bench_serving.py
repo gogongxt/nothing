@@ -325,6 +325,7 @@ async def async_request_openai_chat_completions(
             "temperature": 0.0,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
+            "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
