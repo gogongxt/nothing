@@ -10,6 +10,9 @@ RANDOM_OUTPUT_LEN="1024"
 # Set custom headers via environment variable
 # export CUSTOM_HEADERS='{"Host": "k8s-rsv-jnqjc5-1758863996385-jianshu.serving"}'
 
+# Array to store passthrough arguments
+PASSTHROUGH_ARGS=()
+
 # Usage function
 usage() {
     echo "用法: $0 [选项]"
@@ -23,8 +26,13 @@ usage() {
     echo "  --random-output-len LEN  设置随机输出长度 (默认: $RANDOM_OUTPUT_LEN)"
     echo "  -h, --help               显示帮助信息"
     echo ""
+    echo "透传参数:"
+    echo "  使用 '--' 分隔符，后面的所有参数将被直接传递给 bench_serving.py"
+    echo "  例如: -- --request-rate 10 --backend vllm --dataset-name sharegpt"
+    echo ""
     echo "示例:"
     echo "  $0 --model-path /path/to/model --host localhost --port 30000 --random-input-len 1024 --random-output-len 512"
+    echo "  $0 -- --request-rate 5 --backend vllm # 透传参数给 bench_serving.py"
 }
 
 # Parse command line arguments
@@ -58,6 +66,11 @@ parse_args() {
         --random-output-len)
             RANDOM_OUTPUT_LEN="$2"
             shift 2
+            ;;
+        --)
+            shift
+            PASSTHROUGH_ARGS=("$@")
+            break
             ;;
         -h | --help)
             usage
@@ -103,7 +116,7 @@ for MAX_CONCURRENCY in "${CONCURRENCIES[@]}"; do
     echo "=============================================="
 
     # complete cmd
-    CMD=("${BASE_CMD[@]}" --max-concurrency "$MAX_CONCURRENCY" --num-prompts "$NUM_PROMPTS")
+    CMD=("${BASE_CMD[@]}" --max-concurrency "$MAX_CONCURRENCY" --num-prompts "$NUM_PROMPTS" "${PASSTHROUGH_ARGS[@]}")
     echo "${CMD[@]}"
     echo "----------------------------------------------"
     "${CMD[@]}"
