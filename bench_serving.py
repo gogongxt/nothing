@@ -302,7 +302,12 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
-    if request_func_input.image_data:
+    # Check if image_data contains JSON messages (for custom dataset)
+    if request_func_input.image_data and request_func_input.image_data.startswith("["):
+        # image_data contains the original messages array
+        messages = json.loads(request_func_input.image_data)
+    elif request_func_input.image_data:
+        # Original image handling
         messages = [
             {
                 "role": "user",
@@ -710,6 +715,15 @@ def get_dataset(args, tokenizer):
             dataset_path=args.dataset_path,
             num_turns=args.multi_turn_rounds,
         )
+    elif args.dataset_name == "custom":
+        assert not tokenize_prompt
+        input_requests = sample_custom_dataset(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            max_tokens=args.custom_max_tokens,
+            random_sample=True,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -1045,6 +1059,108 @@ def sample_sharegpt_requests(
     return filtered_dataset
 
 
+def sample_custom_dataset(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    max_tokens: Optional[int] = None,
+    random_sample: bool = True,
+) -> List[DatasetRow]:
+    """
+    Sample requests from custom JSON dataset with messages format.
+
+    Each conversation in the dataset should have a "messages" field containing
+    a list of message objects with "role" and "content" fields.
+
+    The complete messages array is sent directly to the Chat Completions API
+    as a normal request, preserving the full conversation context including
+    system, user, assistant, and tool messages.
+
+    Args:
+        dataset_path: Path to the JSON file containing custom dataset
+        num_requests: Number of requests to sample
+        tokenizer: Tokenizer to use for token counting (approximate)
+        max_tokens: Optional max_tokens limit for all requests. If not specified,
+                   defaults to 4096. The model will naturally stop at EOS when
+                   --disable-ignore-eos is used. This is an upper limit, not a fixed length.
+        random_sample: Whether to randomly sample or take the first N
+
+    Returns:
+        List of DatasetRow objects with complete messages in image_data field
+    """
+    if not is_file_valid_json(dataset_path):
+        raise ValueError(f"Invalid JSON file: {dataset_path}")
+
+    # Load the dataset
+    with open(dataset_path) as f:
+        dataset = json.load(f)
+
+    if not isinstance(dataset, list):
+        raise ValueError("Dataset must be a list of conversation objects")
+
+    # Shuffle the dataset if random sampling
+    if random_sample:
+        random.shuffle(dataset)
+
+    filtered_dataset: List[DatasetRow] = []
+
+    for i in range(len(dataset)):
+        if len(filtered_dataset) == num_requests:
+            break
+
+        try:
+            data = dataset[i]
+
+            if "messages" not in data:
+                continue
+
+            messages = data["messages"]
+
+            if not messages or len(messages) < 2:
+                continue
+
+            # Use the complete messages array directly as a normal request
+            # No need to strip or process - just send as-is to the API
+
+            # Store the messages for sending to API
+            messages_json = json.dumps(messages, ensure_ascii=False)
+
+            # Estimate token length for statistics only
+            # This is approximate since the server applies chat template
+            prompt = messages_json
+            prompt_token_ids = tokenizer.encode(prompt)
+            prompt_len = len(prompt_token_ids)
+
+            # Set max_tokens (upper limit, actual output will vary)
+            # The model will naturally stop at EOS if --disable-ignore-eos is set
+            max_tokens_value = max_tokens if max_tokens is not None else 4096
+
+            # Store the messages as a special field in DatasetRow
+            # We'll use the image_data field to pass the messages JSON
+            filtered_dataset.append(
+                DatasetRow(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    output_len=max_tokens_value,
+                    image_data=messages_json,  # Store complete messages array
+                )
+            )
+
+        except Exception as e:
+            print(f"Warning: Error processing conversation {i}: {e}")
+            continue
+
+    print(f"Loaded {len(filtered_dataset)} custom dataset requests")
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
+    # For custom dataset with --disable-ignore-eos, output is dynamic
+    print(f"#Max tokens limit: {max_tokens if max_tokens is not None else 4096} (actual output: dynamic)")
+
+    if len(filtered_dataset) < num_requests:
+        print(f"Warning: Only {len(filtered_dataset)} valid requests found, less than requested {num_requests}")
+
+    return filtered_dataset
+
+
 def sample_random_requests(
     input_len: int,
     output_len: int,
@@ -1095,35 +1211,50 @@ def sample_random_requests(
 
         # Filter out sequences that are too long or too short
         input_requests: List[DatasetRow] = []
-        for data in dataset:
-            i = len(input_requests)
-            if i == num_prompts:
-                break
 
-            # Tokenize the prompts and completions.
+        # Pre-filter valid data (non-empty prompts)
+        valid_data = []
+        for data in dataset:
             prompt = data[0]
             prompt_token_ids = tokenizer.encode(prompt)
             prompt_len = len(prompt_token_ids)
+            if prompt_len > 0:  # Skip empty prompt
+                valid_data.append((data, prompt_token_ids, prompt_len))
 
-            # Skip empty prompt
-            if prompt_len == 0:
-                continue
+        # If no valid data, fall back to random token generation
+        if not valid_data:
+            print("No valid data found in dataset, falling back to random token generation")
+            random_sample = False
+        else:
+            # Shuffle valid data for better distribution
+            random.shuffle(valid_data)
 
-            if prompt_len > input_lens[i]:
-                input_ids = prompt_token_ids[: input_lens[i]]
-            else:
-                ratio = (input_lens[i] + prompt_len - 1) // prompt_len
-                input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            input_content = input_ids
-            if return_text:
-                input_content = tokenizer.decode(input_content)
-            input_requests.append(
-                DatasetRow(
-                    prompt=input_content,
-                    prompt_len=int(input_lens[i]),
-                    output_len=int(output_lens[i]),
+            # Use data replication strategy to generate enough requests
+            data_index = 0
+            while len(input_requests) < num_prompts:
+                data, prompt_token_ids, prompt_len = valid_data[data_index % len(valid_data)]
+                i = len(input_requests)
+
+                if prompt_len > input_lens[i]:
+                    input_ids = prompt_token_ids[: input_lens[i]]
+                else:
+                    ratio = (input_lens[i] + prompt_len - 1) // prompt_len
+                    input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
+                input_content = input_ids
+                if return_text:
+                    input_content = tokenizer.decode(input_content)
+                input_requests.append(
+                    DatasetRow(
+                        prompt=input_content,
+                        prompt_len=int(input_lens[i]),
+                        output_len=int(output_lens[i]),
+                    )
                 )
-            )
+
+                data_index += 1
+
+            avg_replications = data_index / len(valid_data) if len(valid_data) > 0 else 0
+            print(f"Generated {len(input_requests)} requests from {len(valid_data)} unique data samples (replicated {avg_replications:.1f} times on average)")
     else:
         # Sample token ids from random integers. This can cause some NaN issues.
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
@@ -1983,7 +2114,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu", "multi-turn-shared-prefix"],
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu", "multi-turn-shared-prefix", "custom"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -2016,6 +2147,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
+    )
+    parser.add_argument(
+        "--custom-max-tokens",
+        type=int,
+        default=None,
+        help="Max tokens limit for each request when using custom dataset. If not set, defaults to 4096. Actual output may be less when --disable-ignore-eos is used.",
     )
     parser.add_argument(
         "--random-input-len",
