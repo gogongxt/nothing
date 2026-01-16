@@ -4,9 +4,12 @@ MODEL_PATH="/nfs/ofs-llm-ssd/user/gogongxt/models/Qwen3-8B"
 BENCH_SCRIPT="bench_serving.py"
 DATASET_PATH="/nfs/ofs-llm-ssd/user/gogongxt/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 HOST="127.0.0.1"
-PORT="58888"
+PORT="30000"
 RANDOM_INPUT_LEN="2048"
 RANDOM_OUTPUT_LEN="1024"
+NUM_PROMPT_TIMES=20
+CUSTOM_CONCURRENCIES=()
+USE_CUSTOM_DATASET=false
 # Set custom headers via environment variable
 # export CUSTOM_HEADERS='{"Host": "k8s-rsv-jnqjc5-1758863996385-jianshu.serving"}'
 
@@ -24,6 +27,9 @@ usage() {
     echo "  --port PORT              设置端口 (默认: $PORT)"
     echo "  --random-input-len LEN   设置随机输入长度 (默认: $RANDOM_INPUT_LEN)"
     echo "  --random-output-len LEN  设置随机输出长度 (默认: $RANDOM_OUTPUT_LEN)"
+    echo "  --num-prompt-times N     设置num-prompts倍数 (默认: $NUM_PROMPT_TIMES)"
+    echo "  --concurrency N1 N2 ...  设置并发级别列表 (默认: 1 2 4 8 16 32 64 128)"
+    echo "  --use-custom-dataset     使用自定义数据集 (messages格式)"
     echo "  -h, --help               显示帮助信息"
     echo ""
     echo "透传参数:"
@@ -32,6 +38,9 @@ usage() {
     echo ""
     echo "示例:"
     echo "  $0 --model-path /path/to/model --host localhost --port 30000 --random-input-len 1024 --random-output-len 512"
+    echo "  $0 --use-custom-dataset --dataset-path /path/to/custom.json"
+    echo "  $0 --concurrency 1 4 16 64"
+    echo "  $0 --num-prompt-times 10 --concurrency 1 4 16 64"
     echo "  $0 -- --request-rate 5 --backend vllm # 透传参数给 bench_serving.py"
 }
 
@@ -67,6 +76,26 @@ parse_args() {
             RANDOM_OUTPUT_LEN="$2"
             shift 2
             ;;
+        --num-prompt-times)
+            NUM_PROMPT_TIMES="$2"
+            shift 2
+            ;;
+        --concurrency)
+            shift
+            CUSTOM_CONCURRENCIES=()
+            while [[ $# -gt 0 && ! "$1" =~ ^- ]]; do
+                CUSTOM_CONCURRENCIES+=("$1")
+                shift
+            done
+            if [ ${#CUSTOM_CONCURRENCIES[@]} -eq 0 ]; then
+                echo "错误: --concurrency 需要至少一个值"
+                exit 1
+            fi
+            ;;
+        --use-custom-dataset)
+            USE_CUSTOM_DATASET=true
+            shift
+            ;;
         --)
             shift
             PASSTHROUGH_ARGS=("$@")
@@ -88,6 +117,7 @@ parse_args() {
 # Parse command line arguments FIRST
 parse_args "$@"
 
+# Build base command
 BASE_CMD=(
     python3 "$BENCH_SCRIPT"
     --backend sglang-oai-chat
@@ -95,24 +125,48 @@ BASE_CMD=(
     --host "$HOST"
     --model "$MODEL_PATH"
     --dataset-path "$DATASET_PATH"
-    --dataset-name random
-    --random-input-len "$RANDOM_INPUT_LEN"
-    --random-output-len "$RANDOM_OUTPUT_LEN"
-    --random-range-ratio 1
     --seed 1234
     --extra-request-body '{"stream_options": {"include_usage": true}}'
 )
 
+# Add dataset-specific parameters
+if [ "$USE_CUSTOM_DATASET" = true ]; then
+    BASE_CMD+=(
+        --dataset-name custom
+        --disable-ignore-eos
+        # --custom-max-tokens 4096
+    )
+else
+    BASE_CMD+=(
+        --dataset-name random
+        --random-input-len "$RANDOM_INPUT_LEN"
+        --random-output-len "$RANDOM_OUTPUT_LEN"
+        --random-range-ratio 1
+    )
+fi
+
 # test concurrency table
 CONCURRENCIES=(1 2 4 8 16 32 64 128)
+# Use custom concurrencies if provided
+if [ ${#CUSTOM_CONCURRENCIES[@]} -gt 0 ]; then
+    CONCURRENCIES=("${CUSTOM_CONCURRENCIES[@]}")
+fi
 
 for MAX_CONCURRENCY in "${CONCURRENCIES[@]}"; do
-    NUM_PROMPTS=$((20 * MAX_CONCURRENCY)) # num-prompts = max-concurrency * 20
+    NUM_PROMPTS=$(($NUM_PROMPT_TIMES * MAX_CONCURRENCY)) # num-prompts = max-concurrency * times
 
     echo "=============================================="
     echo "Running benchmark with:"
     echo "  --max-concurrency: $MAX_CONCURRENCY"
     echo "  --num-prompts: $NUM_PROMPTS"
+    if [ "$USE_CUSTOM_DATASET" = true ]; then
+        echo "  Dataset: Custom (messages format)"
+        echo "  EOS: Disabled (natural stopping)"
+    else
+        echo "  Dataset: Random"
+        echo "  Input length: $RANDOM_INPUT_LEN"
+        echo "  Output length: $RANDOM_OUTPUT_LEN"
+    fi
     echo "=============================================="
 
     # complete cmd
