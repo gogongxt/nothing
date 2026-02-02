@@ -8,13 +8,26 @@ PORT="58888"
 HEALTH_URL="http://127.0.0.1:$PORT/health"
 HEALTH_TIMEOUT=600 # 10 min
 HEALTH_INTERVAL=5  # 每 5s 检查一次
-RESTART_WAIT=3     # kill 后等待几秒再重启
+RESTART_WAIT=10    # kill 后等待几秒再重启
+MAX_RESTART=5      # 最大重启次数
 
 ######################################
 # 工具函数
 ######################################
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+send_notification() {
+    local status="$1"
+    local data1="$2"
+    curl -X POST http://81.69.223.147:61061/send \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer gogongxt-apikey" \
+        -d "{
+          \"status\": \"${status}\",
+          \"data1\": \"${data1}\"
+        }" || true
 }
 
 kill_sglang() {
@@ -83,6 +96,7 @@ start_sglang() {
     ######################################
     # 启动 + health check + 重启循环
     ######################################
+    local restart_count=0
     while true; do
         log "Starting sglang"
         log "Command: ${cmd[*]}"
@@ -93,7 +107,13 @@ start_sglang() {
         if wait_for_health_or_restart; then
             return 0
         fi
-        log "Retrying sglang start..."
+        restart_count=$((restart_count + 1))
+        if ((restart_count >= MAX_RESTART)); then
+            log "Failed to start sglang after ${restart_count} attempts, giving up"
+            send_notification "失败" "启动失败: ${cmd[*]}"
+            return 1
+        fi
+        log "Retrying sglang start... (${restart_count}/${MAX_RESTART})"
         sleep 1
     done
 }
@@ -148,9 +168,13 @@ run_test() {
 main() {
     for config in "${TEST_CONFIGS[@]}"; do
         IFS='|' read -r name model tp input_len output_len <<<"$config"
-        run_test "$name" "$model" "$tp" "$input_len" "$output_len"
+        if ! run_test "$name" "$model" "$tp" "$input_len" "$output_len"; then
+            log "Test failed: $name"
+            return 1
+        fi
     done
     log "All tests finished"
+    send_notification "成功" "所有测试完成"
 }
 
 main "$@"
